@@ -40,3 +40,18 @@ python -m build .\leapc-python-bindings\leapc-cffi
 ```powershell
 python .\leap_myosuite.py
 ```
+
+## Cara record
+
+Pastikan window OpenCV aktif/fokus, lalu:
+
+- `r` : start/stop recording (butuh MyoSuite env; kalau tidak ada akan muncul warning)
+
+Output:
+
+- `recordings/ctrl_display_<YYYYmmdd_HHMMSS>_<session>.csv`
+
+Format CSV:
+
+- Kolom awal: `t`, `frame`
+- Lalu: `ctrl_0 ... ctrl_(nu-1)` (nilai `env.sim.data.ctrl`)

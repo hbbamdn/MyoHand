@@ -7,7 +7,21 @@ import fnmatch
 import cv2
 import math
 import sys
+import csv
+import builtins
 from copy import deepcopy
+
+try:
+    builtins.quit = lambda *args, **kwargs: None
+    builtins.exit = lambda *args, **kwargs: None
+except Exception:
+    pass
+
+try:
+    import mujoco
+    _MUJOCO_NATIVE_AVAILABLE = True
+except Exception:
+    _MUJOCO_NATIVE_AVAILABLE = False
 
 _PROJECT_ROOT = os.path.dirname(__file__)
 _LEAP_LOCAL_SRC = os.path.join(
@@ -64,8 +78,20 @@ MYOSUITE_RENDER_FPS = 60
 ENABLE_MYOSUITE_RENDER = True
 DESKTOP_MODE_TRANSFORM = True
 DESKTOP_YAW_OFFSET = -2.040
-RECORD_QPOS = True
-RECORD_DIR = 'recordings'
+
+SHOW_TENSION_IN_CTRL = True
+TENSION_SOURCE = 'probe_act'
+TENSION_EPS = 1e-6
+DISPLAY_ZERO_EPS = 1e-4
+DISPLAY_SMOOTH_ALPHA = 0.25
+TENSION_NORM_MODE = 'global'
+
+PROBE_FORCE_DISPLAY = True
+PROBE_BASE_ACT = 0.0
+PROBE_GAIN = 1.0
+PROBE_MODE = 'heuristic'
+PROBE_ACT_MODE = 'mujoco'
+PROBE_SUBSTEPS = 5
 
 try:
     from myosuite.utils import gym
@@ -84,6 +110,12 @@ QPOS_MAX_STEP_MCP_ABD = 0.10
 JOINT_ANGLE_OVERRIDE_BLEND = 0.70
 
 FINGER_FLEX_DEADZONE_RAD = 0.035
+
+AUTO_RESET_ON_THUMB_STUCK = True
+THUMB_STUCK_EPS = 0.002
+THUMB_STUCK_OTHER_EPS = 0.02
+THUMB_STUCK_FRAMES = 45
+THUMB_STUCK_COOLDOWN_S = 2.0
 
 JOINT_TUNING = {
     "wrist_flex_gain": 1.2,
@@ -460,6 +492,42 @@ def enhanced_leap_to_qpos(hand, arm=None):
 
             alpha = float(QPOS_SMOOTH_ALPHA)
             qpos = prev_qpos * (1.0 - alpha) + q_clamped * alpha
+
+            try:
+                if bool(AUTO_RESET_ON_THUMB_STUCK):
+                    now = time.time()
+                    last_reset_t = float(getattr(enhanced_leap_to_qpos, '_thumb_stuck_last_reset_t', -1e9))
+                    if (now - last_reset_t) >= float(THUMB_STUCK_COOLDOWN_S):
+                        thumb_idx = np.array([3, 4, 5, 6], dtype=int)
+                        other_idx = np.array([0, 1, 2] + list(range(7, 23)), dtype=int)
+                        thumb_idx = thumb_idx[thumb_idx < int(qpos.shape[0])]
+                        other_idx = other_idx[other_idx < int(qpos.shape[0])]
+
+                        d_thumb = 0.0
+                        d_other = 0.0
+                        if thumb_idx.size:
+                            d_thumb = float(np.max(np.abs(qpos[thumb_idx] - prev_qpos[thumb_idx])))
+                        if other_idx.size:
+                            d_other = float(np.max(np.abs(qpos[other_idx] - prev_qpos[other_idx])))
+
+                        cnt = int(getattr(enhanced_leap_to_qpos, '_thumb_stuck_count', 0))
+                        if (d_thumb <= float(THUMB_STUCK_EPS)) and (d_other >= float(THUMB_STUCK_OTHER_EPS)):
+                            cnt += 1
+                        else:
+                            cnt = 0
+                        enhanced_leap_to_qpos._thumb_stuck_count = cnt
+
+                        if cnt >= int(THUMB_STUCK_FRAMES):
+                            try:
+                                print("[WARN] Auto reset: thumb appears stuck; resetting tracking state.", flush=True)
+                            except Exception:
+                                pass
+                            reset_tracking_state()
+                            enhanced_leap_to_qpos._thumb_stuck_last_reset_t = float(now)
+                            enhanced_leap_to_qpos._thumb_stuck_count = 0
+            except Exception:
+                pass
+
             enhanced_leap_to_qpos._prev_qpos = qpos.copy()
     except Exception:
         try:
@@ -478,6 +546,7 @@ def reset_tracking_state():
         '_prev_yaw', '_prev_qpos', '_wf_prev_r',
         '_thumb_prev_n', '_thumb_prev_r',
         '_calib_qpos',
+        '_thumb_stuck_count', '_thumb_stuck_last_reset_t',
     ]
     for attr in attrs_to_reset:
         if hasattr(enhanced_leap_to_qpos, attr):
@@ -491,20 +560,38 @@ def reset_tracking_state():
 def setup_leap_motion_device(connection):
     """Setup and configure Leap Motion device with proper positioning"""
     try:
-        with connection.open():
-            time.sleep(0.3)
-            devices = connection.get_devices()
-            if not devices:
+        t0 = time.time()
+        devices = []
+        while True:
+            try:
+                devices = list(connection.get_devices() or [])
+            except Exception:
+                devices = []
+
+            if devices:
+                break
+
+            if (time.time() - t0) >= 2.0:
+                try:
+                    print(
+                        "[WARN] Leap get_devices() returned empty for 2s. Check Ultraleap Tracking is running and the device is connected.",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
                 return False
 
-            for device in devices:
-                try:
-                    connection.subscribe_events(device)
-                except Exception:
-                    continue
+            time.sleep(0.1)
+
+        for device in devices:
+            try:
+                connection.subscribe_events(device)
+            except Exception:
+                continue
         return True
     except Exception:
         return False
+
 
 _TRACKING_MODES = {
     leap.TrackingMode.Desktop: "Desktop",
@@ -610,59 +697,589 @@ def main():
     tracking_mode = leap.TrackingMode.Desktop
 
     connection = leap.Connection()
-    
-    if not setup_leap_motion_device(connection):
-        return
-    
-    connection.set_tracking_mode(tracking_mode)
+    leap_ok = True
+
     canvas = Canvas() if VISUALIZE_LEAP else None
     if canvas:
         canvas.set_tracking_mode(tracking_mode)
     env = None
-    if ENABLE_MYOSUITE and MYOSUITE_AVAILABLE:
-        try:
-            env = gym.make('myoHandPoseRandom-v0')
-            env.reset()
+
+    _recording = False
+    _record_fh = None
+    _record_writer = None
+    _record_frame = 0
+    _record_session = 0
+    _record_path = None
+
+    def _stop_recording():
+        nonlocal _recording, _record_fh, _record_writer, _record_path
+        if _record_fh is not None:
             try:
-                env.mj_render()
+                _record_fh.flush()
             except Exception:
                 pass
+            try:
+                _record_fh.close()
+            except Exception:
+                pass
+        if _recording:
+            try:
+                print(f"[INFO] Recording stopped: {_record_path}", flush=True)
+            except Exception:
+                pass
+        _recording = False
+        _record_fh = None
+        _record_writer = None
+        _record_path = None
+
+    def _start_recording():
+        nonlocal _recording, _record_fh, _record_writer, _record_frame, _record_session, _record_path
+        if env is None:
+            try:
+                print("[WARN] Cannot start recording: MyoSuite env not created yet.", flush=True)
+            except Exception:
+                pass
+            return
+
+        rec_dir = os.path.join(_PROJECT_ROOT, "recordings")
+        try:
+            os.makedirs(rec_dir, exist_ok=True)
         except Exception:
-            env = None
+            pass
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        session = int(_record_session)
+        while True:
+            fname = f"ctrl_display_{ts}_{session:03d}.csv"
+            path = os.path.join(rec_dir, fname)
+            if not os.path.exists(path):
+                break
+            session += 1
+
+        _record_session = session + 1
+        _record_frame = 0
+        _record_path = path
+
+        try:
+            _record_fh = open(path, "w", newline="")
+            _record_writer = csv.writer(_record_fh)
+
+            try:
+                nu = int(getattr(env.sim.model, 'nu', 0))
+            except Exception:
+                nu = 0
+            names = getattr(listener, '_actuator_names', None)
+            if names is None or len(names) != nu:
+                names = [f"ctrl_{i}" for i in range(int(nu))]
+
+            header = ["t", "frame"] + [str(nm) for nm in names]
+            _record_writer.writerow(header)
+            try:
+                _record_fh.flush()
+            except Exception:
+                pass
+
+            _recording = True
+            try:
+                print(f"[INFO] Recording started: {path}", flush=True)
+            except Exception:
+                pass
+        except Exception as e:
+            _stop_recording()
+            try:
+                print(f"[WARN] Failed to start recording ({type(e).__name__}: {e})", flush=True)
+            except Exception:
+                pass
+
+    try:
+        print("[INFO] Force indicator source: probe (fixed)", flush=True)
+    except Exception:
+        pass
 
     class LeapDataListener(leap.Listener):
         def __init__(self, canvas=None, env=None):
             super().__init__()
             self.canvas = canvas
-            self.latest_qpos = None
             self.env = env
+            self.latest_qpos = None
             self.last_render_time = time.time()
-            self.recording = False
-            self.rec_start_time = None
-            self.rec_t = []
-            self.rec_qpos = []
+            self._actuator_names = None
+            self._ntendon = 0
+            self._nu = 0
+            self._ctrl_baseline = None
+            self._actuator_fmax = None
+            self._actuator_to_tendon = None
+            self._actuator_actadr = None
+            self._probe_model = None
+            self._probe_data = None
+            self._display_norm_prev = None
+            self._init_force_metadata()
 
-        def start_recording(self):
-            self.recording = True
-            self.rec_start_time = time.time()
-            self.rec_t = []
-            self.rec_qpos = []
+        def _init_force_metadata(self):
+            if self.env is None:
+                return
+            try:
+                self._ntendon = int(getattr(self.env.sim.model, 'ntendon', 0))
+            except Exception:
+                self._ntendon = 0
+            try:
+                self._nu = int(getattr(self.env.sim.model, 'nu', 0))
+            except Exception:
+                self._nu = 0
 
-        def stop_recording(self):
-            self.recording = False
+            try:
+                adr = np.asarray(getattr(self.env.sim.model, 'actuator_actadr', []), dtype=int)
+                self._actuator_actadr = adr if adr.size >= int(self._nu) else None
+            except Exception:
+                self._actuator_actadr = None
 
-        def save_recording(self, out_path):
-            if not self.rec_qpos:
-                return False
-            t = np.asarray(self.rec_t, dtype=float)
-            qpos = np.asarray(self.rec_qpos, dtype=float)
-            np.savez(out_path, t=t, qpos=qpos)
-            return True
+            if PROBE_FORCE_DISPLAY and _MUJOCO_NATIVE_AVAILABLE:
+                try:
+                    model_ptr = getattr(self.env.sim.model, 'ptr', None)
+                    if model_ptr is None:
+                        model_ptr = getattr(self.env.sim.model, '_model', None)
+                    if model_ptr is not None:
+                        self._probe_model = model_ptr
+                        self._probe_data = mujoco.MjData(model_ptr)
+                except Exception:
+                    self._probe_model = None
+                    self._probe_data = None
 
-        def clear_recording(self):
-            self.rec_start_time = None
-            self.rec_t = []
-            self.rec_qpos = []
+            try:
+                trnid = np.asarray(self.env.sim.model.actuator_trnid, dtype=int)
+                if trnid.ndim == 2 and trnid.shape[0] >= int(self._nu) and int(self._ntendon) > 0:
+                    tendon_id = np.asarray(trnid[: int(self._nu), 0], dtype=int)
+                    tendon_id = np.where(
+                        (tendon_id >= 0) & (tendon_id < int(self._ntendon)),
+                        tendon_id,
+                        -1,
+                    )
+                    self._actuator_to_tendon = tendon_id
+                else:
+                    self._actuator_to_tendon = None
+            except Exception:
+                self._actuator_to_tendon = None
+
+        def _compute_probe_ctrl(self, qpos_target):
+            if self.env is None:
+                return None
+            try:
+                nu = int(self._nu)
+                if nu <= 0:
+                    return None
+                q = np.asarray(qpos_target, dtype=float).reshape(-1)
+                base = float(PROBE_BASE_ACT)
+                gain = float(PROBE_GAIN)
+                base = float(np.clip(base, 0.0, 1.0))
+                gain = float(max(0.0, gain))
+
+                flex_vals = []
+                finger_flex = np.zeros((4,), dtype=float)
+                finger_mcp_flex = np.zeros((4,), dtype=float)
+                finger_ip_flex = np.zeros((4,), dtype=float)
+                finger_abd = np.zeros((4,), dtype=float)
+                finger_abd_pos = np.zeros((4,), dtype=float)
+                finger_abd_neg = np.zeros((4,), dtype=float)
+                for i in range(4):
+                    off = 7 + i * 4
+                    if off + 3 < int(q.shape[0]):
+                        mcp = float(q[off + 0])
+                        abd = float(q[off + 1])
+                        pip = float(q[off + 2])
+                        dip = float(q[off + 3])
+                        flex_vals.extend([mcp, pip, dip])
+                        finger_mcp_flex[i] = float(np.clip(mcp / 1.5708, 0.0, 1.0))
+                        finger_ip_flex[i] = float(np.clip(np.mean([pip, dip]) / 1.5708, 0.0, 1.0))
+                        finger_flex[i] = float(np.clip(np.mean([mcp, pip, dip]) / 1.5708, 0.0, 1.0))
+                        abd_s = float(np.clip(abd / 0.35, -1.0, 1.0))
+                        finger_abd[i] = float(abs(abd_s))
+                        finger_abd_pos[i] = float(np.clip(abd_s, 0.0, 1.0))
+                        finger_abd_neg[i] = float(np.clip(-abd_s, 0.0, 1.0))
+                if flex_vals:
+                    flex_mean = float(np.clip(np.mean(np.asarray(flex_vals)) / 1.5708, 0.0, 1.0))
+                else:
+                    flex_mean = 0.0
+                open_mean = 1.0 - flex_mean
+
+                finger_open = 1.0 - finger_flex
+
+                wrist_dev = float(q[1]) if int(q.shape[0]) > 1 else 0.0
+                wrist_dev_n = float(np.clip(abs(wrist_dev) / 0.35, 0.0, 1.0))
+                wrist_radial = float(np.clip(wrist_dev / 0.35, 0.0, 1.0))
+                wrist_ulnar = float(np.clip((-wrist_dev) / 0.35, 0.0, 1.0))
+
+                yaw_n = float(np.clip(abs(float(q[0])) / 2.5, 0.0, 1.0)) if int(q.shape[0]) > 0 else 0.0
+
+                thumb_cmc_abd = float(q[3]) if int(q.shape[0]) > 3 else 0.0
+                thumb_cmc_flex = float(q[4]) if int(q.shape[0]) > 4 else 0.0
+                thumb_mcp_flex = float(q[5]) if int(q.shape[0]) > 5 else 0.0
+                thumb_ip_flex = float(q[6]) if int(q.shape[0]) > 6 else 0.0
+
+                thumb_mcp_flex_n = float(np.clip(max(0.0, thumb_mcp_flex) / 0.698132, 0.0, 1.0))
+                thumb_mcp_ext_n = float(np.clip(max(0.0, -thumb_mcp_flex) / 0.698132, 0.0, 1.0))
+                thumb_ip_flex_n = float(np.clip(max(0.0, -thumb_ip_flex) / 1.309, 0.0, 1.0))
+                thumb_ip_ext_n = float(np.clip(max(0.0, thumb_ip_flex) / 0.436332, 0.0, 1.0))
+                thumb_flex = float(0.5 * thumb_mcp_flex_n + 0.5 * thumb_ip_flex_n)
+                thumb_ext = float(0.5 * thumb_mcp_ext_n + 0.5 * thumb_ip_ext_n)
+                thumb_cmc_n = float(np.clip((abs(thumb_cmc_abd) + abs(thumb_cmc_flex)) / (2.0 * 0.698132), 0.0, 1.0))
+                thumb_mcp_n = float(np.clip(abs(thumb_mcp_flex) / 0.698132, 0.0, 1.0))
+                thumb_ip_n = float(np.clip(abs(thumb_ip_flex) / 1.309, 0.0, 1.0))
+                wrist_angle = float(q[2]) if int(q.shape[0]) > 2 else 0.0
+                wrist_flex = float(np.clip(max(0.0, wrist_angle) / 0.785398, 0.0, 1.0))
+                wrist_ext = float(np.clip(max(0.0, -wrist_angle) / 0.785398, 0.0, 1.0))
+
+                names = self._actuator_names
+                if names is None or len(names) != nu:
+                    names = np.asarray([f"act_{i}" for i in range(nu)])
+
+                ctrl = np.full((nu,), base, dtype=float)
+                if str(PROBE_MODE).lower() != 'heuristic':
+                    return np.clip(ctrl, 0.0, 1.0)
+
+                for i in range(nu):
+                    nm = str(names[i])
+
+                    if nm == 'ECRL' or nm == 'ECRB':
+                        ctrl[i] = base + gain * float(0.65 * wrist_ext + 0.35 * wrist_radial)
+                        continue
+                    if nm == 'ECU':
+                        ctrl[i] = base + gain * float(0.65 * wrist_ext + 0.35 * wrist_ulnar)
+                        continue
+                    if nm == 'FCR':
+                        ctrl[i] = base + gain * float(0.65 * wrist_flex + 0.35 * wrist_radial)
+                        continue
+                    if nm == 'FCU':
+                        ctrl[i] = base + gain * float(0.65 * wrist_flex + 0.35 * wrist_ulnar)
+                        continue
+                    if nm == 'PL':
+                        ctrl[i] = base + gain * float(0.75 * wrist_flex + 0.25 * wrist_dev_n)
+                        continue
+                    if nm == 'PT' or nm == 'PQ':
+                        ctrl[i] = base + gain * float(yaw_n)
+                        continue
+
+                    if nm == 'OP':
+                        ctrl[i] = base + gain * float(0.55 * thumb_cmc_n + 0.45 * thumb_mcp_n)
+                        continue
+                    if nm == 'FPL':
+                        ctrl[i] = base + gain * float(0.35 * thumb_mcp_n + 0.65 * thumb_ip_n)
+                        continue
+                    if nm == 'EPL':
+                        ctrl[i] = base + gain * float(thumb_ext)
+                        continue
+                    if nm == 'EPB' or nm == 'APL':
+                        ctrl[i] = base + gain * float(0.60 * thumb_ext + 0.40 * thumb_cmc_n)
+                        continue
+
+                    last_digit = None
+                    if nm and nm[-1].isdigit():
+                        last_digit = ord(nm[-1]) - 48
+
+                    if last_digit in (2, 3, 4, 5):
+                        fi = int(last_digit) - 2
+                        if 0 <= fi < 4:
+                            if nm.startswith('FDP') or nm.startswith('FDS'):
+                                ctrl[i] = base + gain * float(finger_flex[fi])
+                                continue
+                            if nm.startswith('EDC'):
+                                ctrl[i] = base + gain * float(finger_open[fi])
+                                continue
+                            if nm.startswith('LU_RB'):
+                                ctrl[i] = base + gain * float(finger_mcp_flex[fi] * (1.0 - finger_ip_flex[fi]))
+                                continue
+                            if nm.startswith('RI'):
+                                ctrl[i] = base + gain * float(0.80 * finger_abd_pos[fi] + 0.20 * finger_mcp_flex[fi])
+                                continue
+                            if nm.startswith('UI_UB'):
+                                ctrl[i] = base + gain * float(0.80 * finger_abd_neg[fi] + 0.20 * finger_mcp_flex[fi])
+                                continue
+
+                    if nm.startswith('EIP'):
+                        ctrl[i] = base + gain * float(finger_open[0])
+                        continue
+                    if nm.startswith('EDM'):
+                        ctrl[i] = base + gain * float(finger_open[3])
+                        continue
+
+                    is_ext = any(k in nm for k in ["EDC", "EIP", "EDM", "ECU", "ECR", "EPL", "EPB", "APL"])
+                    is_flex = any(k in nm for k in ["FDP", "FDS", "FPL", "FCR", "FCU", "PL"])
+                    is_thumb = any(k in nm for k in ["FPL", "EPL", "EPB", "APL", "OP"])
+                    is_wrist = any(k in nm for k in ["ECR", "ECU", "FCR", "FCU", "PL", "PQ"])
+
+                    if is_thumb and is_ext:
+                        ctrl[i] = base + gain * thumb_ext
+                    elif is_thumb and is_flex:
+                        ctrl[i] = base + gain * thumb_flex
+                    elif is_wrist and is_ext:
+                        ctrl[i] = base + gain * wrist_ext
+                    elif is_wrist and is_flex:
+                        ctrl[i] = base + gain * wrist_flex
+                    elif is_ext:
+                        ctrl[i] = base + gain * open_mean
+                    elif is_flex:
+                        ctrl[i] = base + gain * flex_mean
+                    else:
+                        ctrl[i] = base + 0.5 * gain * (0.5 * flex_mean + 0.5 * open_mean)
+
+                return np.clip(ctrl, 0.0, 1.0)
+            except Exception:
+                return None
+
+        def _update_probe_state(self, qpos_target):
+            if not PROBE_FORCE_DISPLAY:
+                return
+            if not _MUJOCO_NATIVE_AVAILABLE:
+                return
+            if self._probe_model is None or self._probe_data is None:
+                return
+            if qpos_target is None:
+                return
+            try:
+                m = self._probe_model
+                d = self._probe_data
+
+                q = np.asarray(qpos_target, dtype=float).reshape(-1)
+                n = min(int(d.qpos.shape[0]), int(q.shape[0]))
+                d.qpos[:n] = q[:n]
+                if n < int(d.qpos.shape[0]):
+                    d.qpos[n:] = 0.0
+
+                try:
+                    d.qvel[:] = 0.0
+                except Exception:
+                    pass
+
+                ctrl = self._compute_probe_ctrl(q)
+                if ctrl is None:
+                    return
+
+                try:
+                    d.ctrl[:] = 0.0
+                except Exception:
+                    pass
+                nu = min(int(getattr(m, 'nu', 0)), int(d.ctrl.shape[0]), int(ctrl.shape[0]))
+                if nu > 0:
+                    d.ctrl[:nu] = ctrl[:nu]
+
+                mode = str(PROBE_ACT_MODE).lower()
+                if mode in ('copy', 'copy_ctrl', 'direct'):
+                    try:
+                        act = getattr(d, 'act', None)
+                        adr = np.asarray(getattr(m, 'actuator_actadr', []), dtype=int)
+                        if act is not None and adr.size >= nu:
+                            for i in range(nu):
+                                a = int(adr[i])
+                                if 0 <= a < int(act.shape[0]):
+                                    act[a] = float(d.ctrl[i])
+                    except Exception:
+                        pass
+                    mujoco.mj_forward(m, d)
+                else:
+                    steps = int(PROBE_SUBSTEPS) if int(PROBE_SUBSTEPS) > 0 else 1
+                    for _ in range(steps):
+                        try:
+                            d.qpos[:n] = q[:n]
+                            if n < int(d.qpos.shape[0]):
+                                d.qpos[n:] = 0.0
+                            d.qvel[:] = 0.0
+                        except Exception:
+                            pass
+                        mujoco.mj_step(m, d)
+                    try:
+                        d.qpos[:n] = q[:n]
+                        if n < int(d.qpos.shape[0]):
+                            d.qpos[n:] = 0.0
+                        d.qvel[:] = 0.0
+                    except Exception:
+                        pass
+                    mujoco.mj_forward(m, d)
+            except Exception:
+                pass
+
+            try:
+                ctrl_view = getattr(self.env.sim.data, 'ctrl', None)
+                if ctrl_view is not None:
+                    self._ctrl_baseline = np.zeros_like(np.asarray(ctrl_view, dtype=float))
+            except Exception:
+                self._ctrl_baseline = None
+
+            fmax = None
+            try:
+                fr = np.asarray(self.env.sim.model.actuator_forcerange, dtype=float)
+                if fr.ndim == 2 and fr.shape[1] >= 2 and fr.shape[0] >= 1:
+                    m = min(int(fr.shape[0]), int(self._nu))
+                    fmax = np.max(np.abs(fr[:m, :2]), axis=1)
+            except Exception:
+                fmax = None
+
+            try:
+                if fmax is not None:
+                    fmax = np.asarray(fmax, dtype=float)
+                    _mx = float(np.nanmax(fmax)) if fmax.size else 0.0
+                    if (not np.isfinite(_mx)) or (_mx <= 0.0):
+                        fmax = None
+            except Exception:
+                fmax = None
+
+            if fmax is None:
+                try:
+                    gainprm = np.asarray(self.env.sim.model.actuator_gainprm, dtype=float)
+                    if gainprm.ndim == 2 and gainprm.shape[0] >= 1:
+                        fmax = gainprm[: self._nu, 0].copy() if gainprm.shape[1] > 0 else None
+                except Exception:
+                    fmax = None
+
+            try:
+                self._actuator_fmax = np.asarray(fmax, dtype=float) if fmax is not None else None
+            except Exception:
+                self._actuator_fmax = None
+
+            if not _MUJOCO_NATIVE_AVAILABLE:
+                return
+            try:
+                model = getattr(self.env.sim.model, '_model', None)
+                if model is None:
+                    model = self.env.sim.model
+
+                if self._nu > 0:
+                    act_names = []
+                    for i in range(self._nu):
+                        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+                        act_names.append(name if name is not None else "")
+                    self._actuator_names = np.asarray(act_names)
+            except Exception:
+                self._actuator_names = None
+
+        def _get_force_indicator_source(self):
+            if self.env is None:
+                return None, None, "none"
+            try:
+                if self._probe_data is not None and self._probe_model is not None:
+                    return self._probe_data, self._probe_model, "probe"
+            except Exception:
+                pass
+            return self.env.sim.data, self.env.sim.model, "main"
+
+        def _reset_ctrl_to_baseline(self):
+            if self.env is None:
+                return
+            if self._ctrl_baseline is None:
+                return
+            try:
+                ctrl = self.env.sim.data.ctrl
+                n = min(int(ctrl.shape[0]), int(self._ctrl_baseline.shape[0]))
+                ctrl[:n] = self._ctrl_baseline[:n]
+            except Exception:
+                pass
+
+        def _display_tension_in_ctrl(self):
+            if not SHOW_TENSION_IN_CTRL:
+                return
+            if self.env is None:
+                return
+            try:
+                data = self.env.sim.data
+                src_data, _, _ = self._get_force_indicator_source()
+                if src_data is None:
+                    return
+
+                src_mode = str(TENSION_SOURCE).lower()
+
+                if src_mode == 'probe_ctrl':
+                    src_ctrl = getattr(src_data, 'ctrl', None)
+                    if src_ctrl is None:
+                        return
+                    src_ctrl = np.asarray(src_ctrl, dtype=float).reshape(-1)
+                    norm = np.clip(src_ctrl, 0.0, 1.0)
+
+                elif src_mode == 'probe_act':
+                    act_vec = getattr(src_data, 'act', None)
+                    if act_vec is None or self._actuator_actadr is None or int(self._nu) <= 0:
+                        return
+                    act_vec = np.asarray(act_vec, dtype=float).reshape(-1)
+                    adr = np.asarray(self._actuator_actadr, dtype=int)
+                    norm = np.zeros((int(self._nu),), dtype=float)
+                    for i in range(int(self._nu)):
+                        a = int(adr[i]) if i < int(adr.shape[0]) else -1
+                        if 0 <= a < int(act_vec.shape[0]):
+                            norm[i] = float(act_vec[a])
+                    norm = np.clip(norm, 0.0, 1.0)
+
+                else:
+                    if src_mode == 'tendon_force':
+                        ten_force = getattr(src_data, 'ten_force', None)
+                        if ten_force is None:
+                            ten_force = getattr(src_data, 'tendon_force', None)
+                        force = ten_force
+                    else:
+                        force = getattr(src_data, 'actuator_force', None)
+
+                    if force is None:
+                        return
+
+                    force = np.abs(np.asarray(force, dtype=float))
+
+                    if src_mode == 'tendon_force' and self._actuator_to_tendon is not None and int(self._nu) > 0:
+                        mapped = np.zeros((int(self._nu),), dtype=float)
+                        tid = np.asarray(self._actuator_to_tendon, dtype=int)
+                        valid = (tid >= 0) & (tid < int(force.shape[0]))
+                        mapped[valid] = force[tid[valid]]
+                        force = mapped
+
+                    fmax = self._actuator_fmax
+                    use_fmax = (str(TENSION_NORM_MODE).lower() == 'fmax')
+                    if use_fmax and fmax is not None and len(fmax) > 0:
+                        m = min(int(force.shape[0]), int(fmax.shape[0]))
+                        denom = np.asarray(fmax[:m], dtype=float)
+                        denom = np.where(np.isfinite(denom) & (denom > 0), denom, 1.0)
+                        norm = np.zeros_like(force, dtype=float)
+                        norm[:m] = np.clip(force[:m] / (denom + float(TENSION_EPS)), 0.0, 1.0)
+                    else:
+                        finite = force[np.isfinite(force)]
+                        denom = float(np.max(finite)) if finite.size else 1.0
+                        denom = denom if denom > 0 else 1.0
+                        norm = np.clip(force / (denom + float(TENSION_EPS)), 0.0, 1.0)
+
+                try:
+                    z = float(DISPLAY_ZERO_EPS)
+                    if np.isfinite(z) and z > 0:
+                        norm = np.where(np.abs(norm) < z, 0.0, norm)
+                except Exception:
+                    pass
+
+                try:
+                    a = float(DISPLAY_SMOOTH_ALPHA)
+                    if np.isfinite(a) and (a > 0.0) and (a < 1.0):
+                        prev = getattr(self, '_display_norm_prev', None)
+                        if prev is not None:
+                            prev = np.asarray(prev, dtype=float).reshape(-1)
+                            if prev.shape == norm.shape:
+                                norm = prev * (1.0 - a) + norm * a
+                        self._display_norm_prev = np.asarray(norm, dtype=float).reshape(-1).copy()
+                except Exception:
+                    pass
+
+                try:
+                    z = float(DISPLAY_ZERO_EPS)
+                    if np.isfinite(z) and z > 0:
+                        norm = np.where(np.abs(norm) < z, 0.0, norm)
+                except Exception:
+                    pass
+
+                ctrl = data.ctrl
+                n = min(int(ctrl.shape[0]), int(norm.shape[0]))
+                try:
+                    new_ctrl = np.zeros_like(np.asarray(ctrl, dtype=float))
+                    if n > 0:
+                        new_ctrl[:n] = norm[:n]
+                    ctrl[:] = new_ctrl
+                except Exception:
+                    try:
+                        ctrl[:n] = norm[:n]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         def on_tracking_mode_event(self, event):
             if self.canvas:
@@ -670,100 +1287,172 @@ def main():
         
         def on_tracking_event(self, event):
             if len(event.hands) > 0:
-                hand = event.hands[0]  
-                
+                hand = event.hands[0]
                 try:
-                    self.latest_qpos = enhanced_leap_to_qpos(hand, hand.arm)
-
-                except Exception as e:
-                    self.latest_qpos = None
-                if self.latest_qpos is not None:
+                    q = enhanced_leap_to_qpos(hand, hand.arm)
+                except Exception:
+                    q = None
+                if q is not None:
                     try:
-                        q_target = np.asarray(self.latest_qpos, dtype=float)
-                        if self.recording and RECORD_QPOS:
-                            now = time.time()
-                            if self.rec_start_time is None:
-                                self.rec_start_time = now
-                            self.rec_t.append(now - self.rec_start_time)
-                            self.rec_qpos.append(q_target.copy())
-
-                        if self.env is not None:
-                            qpos_view = self.env.sim.data.qpos
-                            n = min(len(qpos_view), len(q_target))
-                            qpos_view[:n] = q_target[:n]
-                            if n < len(qpos_view):
-                                qpos_view[n:] = 0.0
-                            self.env.sim.forward()
+                        self.latest_qpos = np.asarray(q, dtype=float)
                     except Exception:
-                        pass
-
-            else:
-                if self.env is not None:
-                    try:
-                        self.env.sim.forward()
-                    except Exception:
-                        pass
+                        self.latest_qpos = None
 
             if self.canvas:
                 self.canvas.render_hands(event)
-            if self.env is not None and ENABLE_MYOSUITE_RENDER:
-                try:
-                    now = time.time()
-                    if now - self.last_render_time >= 1.0 / float(MYOSUITE_RENDER_FPS):
-                        self.env.mj_render()
-                        self.last_render_time = now
-                except Exception:
-                    pass
 
 
     listener = LeapDataListener(canvas, env)
     connection.add_listener(listener)
+
+    def _handle_keys():
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('x'):
+            try:
+                print("[INFO] Exit requested via key 'x'", flush=True)
+            except Exception:
+                pass
+            return False
+        elif key == ord('0'):
+            reset_tracking_state()
+        elif key == ord('r'):
+            if _recording:
+                _stop_recording()
+            else:
+                _start_recording()
+        elif key == ord('k'):
+            try:
+                if listener.latest_qpos is not None:
+                    enhanced_leap_to_qpos._calib_qpos = np.asarray(listener.latest_qpos, dtype=float).copy()
+                    print('Calibrated open pose baseline')
+            except Exception:
+                pass
+        return True
+
     try:
-        with connection.open():
-            connection.set_tracking_mode(tracking_mode)
-            DESKTOP_MODE_TRANSFORM = (tracking_mode == leap.TrackingMode.Desktop)
-            running = True
-            while running:
-                if VISUALIZE_LEAP and canvas is not None:
-                    cv2.imshow(canvas.name, canvas.output_image)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('x'):
-                    running = False
-                    break
-                elif key == ord('r'):
-                    if RECORD_QPOS:
-                        if listener.recording:
-                            listener.stop_recording()
-                            print(f"Recording stopped. Samples: {len(listener.rec_qpos)}")
-                        else:
-                            listener.start_recording()
-                            print("Recording started")
-                elif key == ord('p'):
-                    if RECORD_QPOS:
-                        try:
-                            os.makedirs(RECORD_DIR, exist_ok=True)
-                            out_path = os.path.join(RECORD_DIR, f"leap_qpos_{int(time.time())}.npz")
-                            ok = listener.save_recording(out_path)
-                            if ok:
-                                print(f"Saved recording: {out_path}")
-                            else:
-                                print("No recording data to save")
-                        except Exception as e:
-                            print(f"Failed to save recording: {e}")
-                elif key == ord('c'):
-                    if RECORD_QPOS:
-                        listener.clear_recording()
-                        print("Recording buffer cleared")
-                elif key == ord('0'):
-                    reset_tracking_state()
-                elif key == ord('k'):
+        if leap_ok:
+            try:
+                print("[INFO] Entering Leap main loop (connection.open)", flush=True)
+            except Exception:
+                pass
+            try:
+                with connection.open():
+                    connection.set_tracking_mode(tracking_mode)
+                    DESKTOP_MODE_TRANSFORM = (tracking_mode == leap.TrackingMode.Desktop)
+
+                    leap_ok = setup_leap_motion_device(connection)
                     try:
-                        if listener.latest_qpos is not None:
-                            enhanced_leap_to_qpos._calib_qpos = np.asarray(listener.latest_qpos, dtype=float).copy()
-                            print('Calibrated open pose baseline')
+                        print(f"[INFO] Leap device available: {bool(leap_ok)}", flush=True)
                     except Exception:
                         pass
-                time.sleep(0.001)
+                    if not leap_ok:
+                        try:
+                            print("[WARN] No Leap Motion device detected. Exiting (LeapOnly=Yes).", flush=True)
+                        except Exception:
+                            pass
+
+                        return
+
+                    if ENABLE_MYOSUITE and MYOSUITE_AVAILABLE:
+                        try:
+                            env = gym.make('myoHandPoseRandom-v0')
+                            env.reset()
+                            try:
+                                env = env.unwrapped
+                            except Exception:
+                                pass
+                        except Exception:
+                            env = None
+
+                    try:
+                        print(f"[INFO] MyoSuite env created: {env is not None}", flush=True)
+                    except Exception:
+                        pass
+                    if env is not None:
+                        try:
+                            _nu_dbg = int(getattr(env.sim.model, 'nu', 0))
+                            _ntendon_dbg = int(getattr(env.sim.model, 'ntendon', 0))
+                            _ctrl_dbg = getattr(env.sim.data, 'ctrl', None)
+                            _ctrl_n_dbg = int(np.asarray(_ctrl_dbg).shape[0]) if _ctrl_dbg is not None else 0
+                            print(f"[INFO] dims: nu={_nu_dbg} ntendon={_ntendon_dbg} ctrl={_ctrl_n_dbg}", flush=True)
+                        except Exception:
+                            pass
+
+                    try:
+                        listener.env = env
+                        listener._init_force_metadata()
+                    except Exception:
+                        pass
+
+                    running = True
+                    last_render_time = time.time()
+                    _printed_loop = False
+                    while running:
+                        if not _printed_loop:
+                            try:
+                                print("[INFO] Leap loop running", flush=True)
+                            except Exception:
+                                pass
+                            _printed_loop = True
+                        if VISUALIZE_LEAP and canvas is not None:
+                            cv2.imshow(canvas.name, canvas.output_image)
+
+                        if env is not None and ENABLE_MYOSUITE_RENDER:
+                            try:
+                                now = time.time()
+                                if now - last_render_time >= 1.0 / float(MYOSUITE_RENDER_FPS):
+                                    q_target = getattr(listener, 'latest_qpos', None)
+                                    if q_target is not None:
+                                        qpos_view = env.sim.data.qpos
+                                        n = min(len(qpos_view), len(q_target))
+                                        qpos_view[:n] = q_target[:n]
+                                        if n < len(qpos_view):
+                                            qpos_view[n:] = 0.0
+                                    if not SHOW_TENSION_IN_CTRL:
+                                        listener._reset_ctrl_to_baseline()
+                                    env.sim.forward()
+
+                                    try:
+                                        listener._update_probe_state(qpos_view)
+                                    except Exception:
+                                        pass
+
+                                    listener._display_tension_in_ctrl()
+                                    if _recording and _record_writer is not None:
+                                        try:
+                                            ctrl_vec = np.asarray(env.sim.data.ctrl, dtype=float).reshape(-1)
+                                            row = [float(now), int(_record_frame)] + [float(x) for x in ctrl_vec]
+                                            _record_writer.writerow(row)
+                                            _record_frame += 1
+                                            if (_record_frame % 30) == 0 and _record_fh is not None:
+                                                _record_fh.flush()
+                                        except Exception:
+                                            pass
+
+                                    env.mj_render()
+                                    last_render_time = now
+                            except Exception:
+                                pass
+                        running = _handle_keys()
+                        time.sleep(0.001)
+            except BaseException as e:
+                if isinstance(e, KeyboardInterrupt):
+                    raise
+                leap_ok = False
+                try:
+                    print(f"[WARN] Leap connection failed ({type(e).__name__}: {e}).", flush=True)
+                except Exception:
+                    pass
+            try:
+                print("[INFO] Exited Leap main loop", flush=True)
+            except Exception:
+                pass
+
+            if not leap_ok:
+                try:
+                    print("[WARN] Leap unavailable; exiting (LeapOnly=Yes)", flush=True)
+                except Exception:
+                    pass
     except KeyboardInterrupt:
         pass
     finally:
@@ -772,10 +1461,14 @@ def main():
                 cv2.destroyAllWindows()
             except Exception:
                 pass
+        try:
+            _stop_recording()
+        except Exception:
+            pass
         if env is not None:
             try:
                 env.close()
-            except Exception:
+            except BaseException:
                 pass
 
 if __name__ == '__main__':
