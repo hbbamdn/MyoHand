@@ -3,37 +3,38 @@
 
 ## Prasyarat
 
-- Ultraleap **Gemini Hand Tracking Software** sudah ter-install dan service berjalan
 - Kamera Ultraleap/Leap terhubung
 - Python **>= 3.9** (untuk MyoSuite)
 
+
 ## Instalasi (Windows / PowerShell)
 
-Jalankan dari folder project ini (`leapMyoHand`):
-
-```powershell
+```
+powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 python -m pip install -U pip
+```
+
+## Setup Leap Motion
+
+
+Unduh dan instal Ultraleap **Gemini Hand Tracking Software** dari [ultraleap.com/downloads](https://www.ultraleap.com/downloads/) lalu pastikan servicenya berjalan.
+Dengan kamera sudah terhubung dan virtual environment aktif (lihat bagian Instalasi di bawah), 
+```powershell
 pip install -r requirements.txt
 ```
 
-## Set path LeapSDK (jika perlu)
-
-Kalau Gemini tidak di lokasi default, set `LEAPSDK_INSTALL_LOCATION` ke folder `LeapSDK`:
+## Setup MyoSuite
 
 ```powershell
-$env:LEAPSDK_INSTALL_LOCATION = "C:\Program Files\Ultraleap\LeapSDK"
+pip install -U myosuite
+python -m myosuite_init
+python -m myosuite.tests.test_myo
 ```
 
-## Build `leapc_cffi` (hanya jika import `leap` gagal)
+Langkah di atas mengunduh paket MyoSuite, menarik aset SimHive (akan meminta konfirmasi lisensi), dan menjalankan tes bawaan untuk memastikan semua environment terdaftar dengan benar.
 
-Kalau muncul error seperti `ModuleNotFoundError: No module named 'leapc_cffi._leapc_cffi'`:
-
-```powershell
-pip install -r .\leapc-python-bindings\requirements.txt
-python -m build .\leapc-python-bindings\leapc-cffi
-```
 
 ## Run
 

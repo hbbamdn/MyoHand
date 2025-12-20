@@ -31,7 +31,7 @@ _LEAP_LOCAL_SRC = os.path.join(
     "src",
 )
 if _LEAP_LOCAL_SRC not in sys.path:
-    sys.path.append(_LEAP_LOCAL_SRC)
+    sys.path.insert(0, _LEAP_LOCAL_SRC)
 
 _LOCAL_CFFI_LOCATION = os.path.join(
     _PROJECT_ROOT,
