@@ -14,6 +14,7 @@ powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 python -m pip install -U pip
+pip install -r requirements.txt
 ```
 
 ## Setup Leap Motion
@@ -22,7 +23,9 @@ python -m pip install -U pip
 Unduh dan instal Ultraleap **Gemini Hand Tracking Software** dari [ultraleap.com/downloads](https://www.ultraleap.com/downloads/) lalu pastikan servicenya berjalan.
 Dengan kamera sudah terhubung dan virtual environment aktif (lihat bagian Instalasi di bawah), 
 ```powershell
-pip install -r requirements.txt
+python -m build .\leapc-python-bindings\leapc-cffi
+pip install .\leapc-cffi\dist\leapc_cffi-0.0.1.tar.gz
+pip install -e leapc-python-api
 ```
 
 ## Setup MyoSuite
